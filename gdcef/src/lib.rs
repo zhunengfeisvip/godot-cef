@@ -231,13 +231,26 @@ impl CefTexture {
 
     fn create_software_browser(
         &mut self,
-        window_info: &WindowInfo,
+        _window_info: &WindowInfo,
         browser_settings: &BrowserSettings,
         context: Option<&mut cef::RequestContext>,
         dpi: f32,
         pixel_width: i32,
         pixel_height: i32,
     ) -> Option<cef::Browser> {
+        let window_info = WindowInfo {
+            bounds: cef::Rect {
+                x: 0,
+                y: 0,
+                width: pixel_width,
+                height: pixel_height,
+            },
+            windowless_rendering_enabled: true as _,
+            shared_texture_enabled: false as _,
+            external_begin_frame_enabled: true as _,
+            ..Default::default()
+        };
+
         let render_handler = cef_app::OsrRenderHandler::new(
             dpi,
             PhysicalSize::new(pixel_width as f32, pixel_height as f32),
@@ -262,7 +275,7 @@ impl CefTexture {
         let mut client = webrender::SoftwareClientImpl::build(render_handler);
 
         cef::browser_host_create_browser_sync(
-            Some(window_info),
+            Some(&window_info),
             Some(&mut client),
             Some(&self.url.to_string().as_str().into()),
             Some(browser_settings),
@@ -281,7 +294,6 @@ impl CefTexture {
         pixel_width: i32,
         pixel_height: i32,
     ) -> Option<cef::Browser> {
-        // Try to create the GPU texture importer
         let importer = match accelerated_osr::GodotTextureImporter::new() {
             Some(imp) => imp,
             None => {
@@ -341,7 +353,6 @@ impl CefTexture {
         pixel_width: i32,
         pixel_height: i32,
     ) -> Option<cef::Browser> {
-        // On non-macOS platforms, fall back to software rendering
         self.create_software_browser(
             window_info,
             browser_settings,
@@ -426,7 +437,6 @@ impl CefTexture {
     }
 
     fn update_texture(&mut self) {
-        // Handle software rendering
         if let Some(RenderMode::Software {
             frame_buffer,
             texture,
@@ -453,7 +463,6 @@ impl CefTexture {
             return;
         }
 
-        // Handle accelerated rendering (macOS only)
         #[cfg(target_os = "macos")]
         {
             let canvas_item = self.base().get_canvas_item();

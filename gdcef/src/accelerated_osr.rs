@@ -1,19 +1,3 @@
-//! Accelerated Off-Screen Rendering (OSR) for macOS
-//!
-//! This module implements GPU-accelerated texture sharing between CEF and Godot
-//! using IOSurface on macOS. When enabled, CEF renders to an IOSurface which is
-//! imported as a Metal texture and shared directly with Godot via
-//! `RenderingServer.texture_create_from_native_handle()`.
-//!
-//! ## Architecture (Zero-Copy)
-//!
-//! ```text
-//! CEF (Chromium) -> IOSurface -> Metal Texture -> Godot RenderingServer
-//! ```
-//!
-//! This approach avoids any CPU copies - the IOSurface rendered by CEF's GPU
-//! compositor is directly imported into Godot's rendering pipeline.
-
 use cef::{AcceleratedPaintInfo, PaintElementType};
 use godot::classes::image::Format as ImageFormat;
 use godot::classes::rendering_server::TextureType;
@@ -62,7 +46,38 @@ fn io_surface_release(io_surface: *mut c_void) {
     }
 }
 
-/// Shared IOSurface texture info from CEF with reference counting.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RenderBackend {
+    Metal,
+    Vulkan,
+    D3D12,
+    Unknown,
+}
+
+impl RenderBackend {
+    pub fn detect() -> Self {
+        let rs = RenderingServer::singleton();
+        let rd = rs.get_current_rendering_driver_name().to_string();
+        let backend = if rd.contains("metal") {
+            RenderBackend::Metal
+        } else if rd.contains("vulkan") {
+            RenderBackend::Vulkan
+        } else if rd.contains("d3d12") {
+            RenderBackend::D3D12
+        } else {
+            RenderBackend::Unknown
+        };
+
+        godot_print!(
+            "[AcceleratedOSR] Detected render backend: {:?}",
+            backend,
+        );
+        
+        backend
+    }
+}
+
 pub struct SharedTextureInfo {
     io_surface: *mut c_void,
     pub width: u32,
@@ -152,7 +167,6 @@ pub struct MetalTextureImporter {
 impl MetalTextureImporter {
     pub fn new() -> Option<Self> {
         let device = metal::Device::system_default()?;
-        godot_print!("[AcceleratedOSR] Metal device: {}", device.name());
         Some(Self { device })
     }
 
@@ -163,7 +177,7 @@ impl MetalTextureImporter {
         width: u32,
         height: u32,
         format: cef::sys::cef_color_type_t,
-    ) -> Result<u64, String> {
+    ) -> Result<*mut objc::runtime::Object, String> {
         use metal::{MTLPixelFormat, MTLStorageMode, MTLTextureType, MTLTextureUsage};
         use objc::{sel, sel_impl};
 
@@ -174,20 +188,13 @@ impl MetalTextureImporter {
             return Err(format!("Invalid dimensions: {}x{}", width, height));
         }
 
-        // Validate IOSurface dimensions
         let (ios_width, ios_height) = unsafe {
-            (
-                IOSurfaceGetWidth(io_surface),
-                IOSurfaceGetHeight(io_surface),
-            )
+            (IOSurfaceGetWidth(io_surface), IOSurfaceGetHeight(io_surface))
         };
         if ios_width != width as usize || ios_height != height as usize {
             godot_warn!(
                 "[AcceleratedOSR] Dimension mismatch: IOSurface {}x{}, expected {}x{}",
-                ios_width,
-                ios_height,
-                width,
-                height
+                ios_width, ios_height, width, height
             );
         }
 
@@ -217,11 +224,10 @@ impl MetalTextureImporter {
             return Err("Metal texture creation failed".into());
         }
 
-        Ok(texture as u64)
+        Ok(texture)
     }
 }
 
-/// Handler for CEF's on_accelerated_paint callback.
 pub struct AcceleratedRenderHandler {
     pub texture_info: Arc<Mutex<SharedTextureInfo>>,
     pub device_scale_factor: Arc<Mutex<f32>>,
@@ -251,14 +257,8 @@ impl AcceleratedRenderHandler {
     }
 
     pub fn on_accelerated_paint(&self, type_: PaintElementType, info: Option<&AcceleratedPaintInfo>) {
-        let Some(info) = info else {
-            return;
-        };
-
-        // Only handle main frame (PET_VIEW)
-        if type_ != PaintElementType::default() {
-            return;
-        }
+        let Some(info) = info else { return };
+        if type_ != PaintElementType::default() { return }
 
         if let Ok(mut tex_info) = self.texture_info.lock() {
             tex_info.frame_count += 1;
@@ -289,12 +289,18 @@ impl AcceleratedRenderHandler {
     }
 }
 
-/// Imports IOSurface textures into Godot via native handle API.
+#[cfg(target_os = "macos")]
+enum TextureBackend {
+    Metal {
+        current_texture: Option<*mut objc::runtime::Object>,
+    },
+}
+
 #[cfg(target_os = "macos")]
 pub struct GodotTextureImporter {
     metal_importer: MetalTextureImporter,
+    backend: TextureBackend,
     current_texture_rid: Option<Rid>,
-    current_metal_texture: Option<*mut objc::runtime::Object>,
     color_swap_shader: Option<Rid>,
     color_swap_material: Option<Rid>,
 }
@@ -304,9 +310,7 @@ pub struct GodotTextureImporter {
 fn release_metal_texture(texture: *mut objc::runtime::Object) {
     use objc::{sel, sel_impl};
     if !texture.is_null() {
-        unsafe {
-            let _: () = objc::msg_send![texture, release];
-        }
+        unsafe { let _: () = objc::msg_send![texture, release]; }
     }
 }
 
@@ -314,8 +318,29 @@ fn release_metal_texture(texture: *mut objc::runtime::Object) {
 impl GodotTextureImporter {
     pub fn new() -> Option<Self> {
         let metal_importer = MetalTextureImporter::new()?;
-        let mut rs = RenderingServer::singleton();
+        let render_backend = RenderBackend::detect();
 
+        godot_print!("[AcceleratedOSR] Detected render backend: {:?}", render_backend);
+
+        let backend = match render_backend {
+            RenderBackend::Metal => {
+                godot_print!("[AcceleratedOSR] Using Metal backend");
+                TextureBackend::Metal { current_texture: None }
+            }
+            RenderBackend::Vulkan => {
+                godot_warn!(
+                    "[AcceleratedOSR] Vulkan backend detected. Accelerated OSR on macOS requires Metal. \
+                    Consider using Metal backend for best performance."
+                );
+                return None;
+            }
+            _ => {
+                godot_warn!("[AcceleratedOSR] Unknown render backend, attempting Metal path");
+                return None;
+            }
+        };
+
+        let mut rs = RenderingServer::singleton();
         let shader_rid = rs.shader_create();
         rs.shader_set_code(shader_rid, COLOR_SWAP_SHADER);
         let material_rid = rs.material_create();
@@ -323,8 +348,8 @@ impl GodotTextureImporter {
 
         Some(Self {
             metal_importer,
+            backend,
             current_texture_rid: None,
-            current_metal_texture: None,
             color_swap_shader: Some(shader_rid),
             color_swap_material: Some(material_rid),
         })
@@ -340,44 +365,38 @@ impl GodotTextureImporter {
             return None;
         }
 
-        let metal_handle = self
+        let metal_texture = self
             .metal_importer
-            .import_io_surface(
-                io_surface,
-                texture_info.width,
-                texture_info.height,
-                texture_info.format,
-            )
+            .import_io_surface(io_surface, texture_info.width, texture_info.height, texture_info.format)
             .map_err(|e| godot_error!("[AcceleratedOSR] Metal import failed: {}", e))
             .ok()?;
-
-        let metal_texture = metal_handle as *mut objc::runtime::Object;
 
         if let Some(old_rid) = self.current_texture_rid.take() {
             RenderingServer::singleton().free_rid(old_rid);
         }
-        if let Some(old_metal) = self.current_metal_texture.take() {
-            release_metal_texture(old_metal);
+
+        let TextureBackend::Metal { current_texture } = &mut self.backend;
+        if let Some(old) = current_texture.take() {
+            release_metal_texture(old);
         }
+        *current_texture = Some(metal_texture);
+        let native_handle = metal_texture as u64;
 
         let texture_rid = RenderingServer::singleton().texture_create_from_native_handle(
             TextureType::TYPE_2D,
             ImageFormat::RGBA8,
-            metal_handle,
+            native_handle,
             texture_info.width as i32,
             texture_info.height as i32,
             1,
         );
 
         if !texture_rid.is_valid() {
-            release_metal_texture(metal_texture);
             godot_error!("[AcceleratedOSR] Created texture RID is invalid");
             return None;
         }
 
         self.current_texture_rid = Some(texture_rid);
-        self.current_metal_texture = Some(metal_texture);
-
         Some(texture_rid)
     }
 }
@@ -389,8 +408,9 @@ impl Drop for GodotTextureImporter {
         if let Some(rid) = self.current_texture_rid.take() {
             rs.free_rid(rid);
         }
-        if let Some(metal) = self.current_metal_texture.take() {
-            release_metal_texture(metal);
+        let TextureBackend::Metal { current_texture } = &mut self.backend;
+        if let Some(tex) = current_texture.take() {
+            release_metal_texture(tex);
         }
         if let Some(rid) = self.color_swap_material.take() {
             rs.free_rid(rid);
