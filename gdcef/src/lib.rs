@@ -1,12 +1,14 @@
 mod webrender;
 mod utils;
 
-use cef::{BrowserSettings, ImplBrowser, ImplBrowserHost, RequestContextSettings, Settings, WindowInfo, api_hash, quit_message_loop, run_message_loop};
+use cef::{BrowserSettings, ImplBrowser, ImplBrowserHost, MouseButtonType, MouseEvent, RequestContextSettings, Settings, WindowInfo, api_hash, quit_message_loop, run_message_loop};
+use cef::sys::cef_event_flags_t;
 use cef_app::FrameBuffer;
 use godot::classes::notify::ControlNotification;
-use godot::classes::{ITextureRect, Image, ImageTexture, Os, TextureRect};
+use godot::classes::{ITextureRect, Image, ImageTexture, InputEvent, InputEventMouseButton, InputEventMouseMotion, Os, TextureRect};
 use godot::classes::texture_rect::ExpandMode;
 use godot::classes::image::Format as ImageFormat;
+use godot::global::{MouseButton, MouseButtonMask};
 use godot::init::*;
 use godot::prelude::*;
 use winit::dpi::{PhysicalSize};
@@ -80,6 +82,14 @@ impl ITextureRect for CefTexture {
             }
             _ => {}
         }
+    }
+
+    // fn gui_input(&mut self, event: Gd<InputEvent>) {
+    //     self.handle_input_event(event);
+    // }
+
+    fn input(&mut self, event: Gd<InputEvent>) {
+        self.handle_input_event(event);
     }
 }
 
@@ -391,6 +401,151 @@ impl CefTexture {
                 host.send_external_begin_frame();
             }
         }
+    }
+
+    fn handle_input_event(&mut self, event: Gd<InputEvent>) {
+        if let Ok(mouse_button) = event.clone().try_cast::<InputEventMouseButton>() {
+            self.handle_mouse_button_event(&mouse_button);
+        } else if let Ok(mouse_motion) = event.try_cast::<InputEventMouseMotion>() {
+            self.handle_mouse_motion_event(&mouse_motion);
+        }
+    }
+
+    fn handle_mouse_button_event(&mut self, event: &Gd<InputEventMouseButton>) {
+        let Some(browser) = self.app.browser.as_mut() else {
+            return;
+        };
+        let Some(host) = browser.host() else {
+            return;
+        };
+
+        let position = event.get_position();
+        let dpi = self.get_content_scale_factor();
+        let mouse_event = self.create_mouse_event(position, dpi, Self::get_modifiers_from_event(event));
+
+        match event.get_button_index() {
+            MouseButton::LEFT | MouseButton::MIDDLE | MouseButton::RIGHT => {
+                let button_type = match event.get_button_index() {
+                    MouseButton::LEFT => MouseButtonType::LEFT,
+                    MouseButton::MIDDLE => MouseButtonType::MIDDLE,
+                    MouseButton::RIGHT => MouseButtonType::RIGHT,
+                    _ => unreachable!(),
+                };
+                let mouse_up = !event.is_pressed();
+                let click_count = if event.is_double_click() { 2 } else { 1 };
+                host.send_mouse_click_event(Some(&mouse_event), button_type, mouse_up as i32, click_count);
+            }
+            MouseButton::WHEEL_UP => {
+                let factor = event.get_factor();
+                let delta = (120.0 * factor) as i32;
+                godot_print!("WHEEL_UP: factor={}, delta={}", factor, delta);
+                host.send_mouse_wheel_event(Some(&mouse_event), 0, delta);
+            }
+            MouseButton::WHEEL_DOWN => {
+                let factor = event.get_factor();
+                let delta = (120.0 * factor) as i32;
+                godot_print!("WHEEL_DOWN: factor={}, delta={}", factor, delta);
+                host.send_mouse_wheel_event(Some(&mouse_event), 0, -delta);
+            }
+            MouseButton::WHEEL_LEFT => {
+                let factor = event.get_factor();
+                let delta = (120.0 * factor) as i32;
+                godot_print!("WHEEL_LEFT: factor={}, delta={}", factor, delta);
+                host.send_mouse_wheel_event(Some(&mouse_event), -delta, 0);
+            }
+            MouseButton::WHEEL_RIGHT => {
+                let factor = event.get_factor();
+                let delta = (120.0 * factor) as i32;
+                godot_print!("WHEEL_RIGHT: factor={}, delta={}", factor, delta);
+                host.send_mouse_wheel_event(Some(&mouse_event), delta, 0);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mouse_motion_event(&mut self, event: &Gd<InputEventMouseMotion>) {
+        let Some(browser) = self.app.browser.as_mut() else {
+            return;
+        };
+        let Some(host) = browser.host() else {
+            return;
+        };
+
+        let position = event.get_position();
+        let dpi = self.get_content_scale_factor();
+        let mouse_event = self.create_mouse_event(position, dpi, Self::get_modifiers_from_motion_event(event));
+        host.send_mouse_move_event(Some(&mouse_event), false as i32);
+    }
+
+    fn create_mouse_event(&self, position: Vector2, dpi: f32, modifiers: u32) -> MouseEvent {
+        let x = (position.x * dpi) as i32;
+        let y = (position.y * dpi) as i32;
+
+        MouseEvent {
+            x,
+            y,
+            modifiers,
+        }
+    }
+
+    fn get_modifiers_from_event(event: &Gd<InputEventMouseButton>) -> u32 {
+        let mut modifiers = cef_event_flags_t::EVENTFLAG_NONE.0;
+
+        if event.is_shift_pressed() {
+            modifiers |= cef_event_flags_t::EVENTFLAG_SHIFT_DOWN.0;
+        }
+        if event.is_ctrl_pressed() {
+            modifiers |= cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0;
+        }
+        if event.is_alt_pressed() {
+            modifiers |= cef_event_flags_t::EVENTFLAG_ALT_DOWN.0;
+        }
+        if event.is_meta_pressed() {
+            modifiers |= cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0;
+        }
+
+        let button_mask = event.get_button_mask();
+        if button_mask.is_set(MouseButtonMask::LEFT) {
+            modifiers |= cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON.0;
+        }
+        if button_mask.is_set(MouseButtonMask::MIDDLE) {
+            modifiers |= cef_event_flags_t::EVENTFLAG_MIDDLE_MOUSE_BUTTON.0;
+        }
+        if button_mask.is_set(MouseButtonMask::RIGHT) {
+            modifiers |= cef_event_flags_t::EVENTFLAG_RIGHT_MOUSE_BUTTON.0;
+        }
+
+        modifiers
+    }
+
+    fn get_modifiers_from_motion_event(event: &Gd<InputEventMouseMotion>) -> u32 {
+        let mut modifiers = cef_event_flags_t::EVENTFLAG_NONE.0;
+
+        if event.is_shift_pressed() {
+            modifiers |= cef_event_flags_t::EVENTFLAG_SHIFT_DOWN.0;
+        }
+        if event.is_ctrl_pressed() {
+            modifiers |= cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0;
+        }
+        if event.is_alt_pressed() {
+            modifiers |= cef_event_flags_t::EVENTFLAG_ALT_DOWN.0;
+        }
+        if event.is_meta_pressed() {
+            modifiers |= cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0;
+        }
+
+        let button_mask = event.get_button_mask();
+        if button_mask.is_set(MouseButtonMask::LEFT) {
+            modifiers |= cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON.0;
+        }
+        if button_mask.is_set(MouseButtonMask::MIDDLE) {
+            modifiers |= cef_event_flags_t::EVENTFLAG_MIDDLE_MOUSE_BUTTON.0;
+        }
+        if button_mask.is_set(MouseButtonMask::RIGHT) {
+            modifiers |= cef_event_flags_t::EVENTFLAG_RIGHT_MOUSE_BUTTON.0;
+        }
+
+        modifiers
     }
 }
 

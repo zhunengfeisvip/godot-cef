@@ -103,21 +103,53 @@ impl RenderHandlerBuilder {
     }
 }
 
+wrap_context_menu_handler! {
+    pub(crate) struct ContextMenuHandlerBuilder {}
+
+    impl ContextMenuHandler {
+        fn on_before_context_menu(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _params: Option<&mut ContextMenuParams>,
+            model: Option<&mut MenuModel>,
+        ) {
+            if let Some(model) = model {
+                model.clear();
+            }
+        }
+    }
+}
+
+impl ContextMenuHandlerBuilder {
+    pub fn build() -> ContextMenuHandler {
+        Self::new()
+    }
+}
+
 wrap_client! {
     pub(crate) struct ClientBuilder {
         render_handler: RenderHandler,
+        context_menu_handler: ContextMenuHandler,
     }
 
     impl Client {
         fn render_handler(&self) -> Option<cef::RenderHandler> {
             Some(self.render_handler.clone())
         }
+
+        fn context_menu_handler(&self) -> Option<cef::ContextMenuHandler> {
+            Some(self.context_menu_handler.clone())
+        }
     }
 }
 
 impl ClientBuilder {
     pub(crate) fn build(render_handler: cef_app::OsrRenderHandler) -> Client {
-        Self::new(RenderHandlerBuilder::build(render_handler))
+        Self::new(
+            RenderHandlerBuilder::build(render_handler),
+            ContextMenuHandlerBuilder::build(),
+        )
     }
 }
 
