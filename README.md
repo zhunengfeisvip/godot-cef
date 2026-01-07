@@ -1,6 +1,6 @@
 # Godot CEF
 
-A high-performance Chromium Embedded Framework (CEF) integration for Godot Engine 4.4 and above, written in Rust. Render web content directly inside your Godot games and applications with full support for modern web standards, JavaScript, HTML5, and CSS3.
+A high-performance Chromium Embedded Framework (CEF) integration for Godot Engine 4.5 and above, written in Rust. Render web content directly inside your Godot games and applications with full support for modern web standards, JavaScript, HTML5, and CSS3.
 
 ## ✨ Features
 
