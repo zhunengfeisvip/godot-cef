@@ -1,9 +1,14 @@
-use serde::Serialize;
-use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(target_os = "macos")]
+use serde::Serialize;
+#[cfg(target_os = "macos")]
+use std::collections::HashMap;
+
+#[cfg(target_os = "macos")]
 #[derive(Serialize)]
 pub struct AppInfoPlist {
     #[serde(rename = "CFBundleDevelopmentRegion")]
@@ -47,6 +52,7 @@ pub struct AppInfoPlist {
     pub ns_microphone_usage_description: String,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Serialize)]
 pub struct FrameworkInfoPlist {
     #[serde(rename = "CFBundleDevelopmentRegion")]
@@ -78,6 +84,7 @@ pub struct FrameworkInfoPlist {
     pub ls_ui_element: Option<String>,
 }
 
+#[cfg(target_os = "macos")]
 impl AppInfoPlist {
     pub fn new(exec_name: &str, is_helper: bool) -> Self {
         Self {
@@ -111,6 +118,7 @@ impl AppInfoPlist {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl FrameworkInfoPlist {
     pub fn new(lib_name: &str) -> Self {
         Self {
@@ -171,4 +179,8 @@ pub fn get_target_dir(release: bool, custom_target_dir: Option<&Path>) -> PathBu
             .join("target")
     });
     base.join(profile)
+}
+
+pub fn get_cef_dir() -> Option<PathBuf> {
+    env::var("CEF_PATH").ok().map(PathBuf::from)
 }
