@@ -1,166 +1,30 @@
-use super::{NativeHandleTrait, RenderBackend, SharedTextureInfo, TextureImporterTrait};
-use cef::AcceleratedPaintInfo;
+use super::RenderBackend;
 use godot::classes::RenderingServer;
 use godot::classes::rendering_device::DriverResource;
 use godot::global::{godot_error, godot_print, godot_warn};
 use godot::prelude::*;
 use std::ffi::c_void;
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_RESOURCE_BARRIER,
     D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
     D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DESC,
     D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_STATE_COMMON,
-    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
-    D3D12_RESOURCE_TRANSITION_BARRIER, ID3D12CommandAllocator, ID3D12CommandQueue, ID3D12Device,
-    ID3D12Fence, ID3D12GraphicsCommandList, ID3D12Resource,
+    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_TRANSITION_BARRIER, ID3D12CommandAllocator,
+    ID3D12CommandQueue, ID3D12Device, ID3D12Fence, ID3D12GraphicsCommandList, ID3D12Resource,
 };
-use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, INFINITE, WaitForSingleObject,
-};
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Interface;
 
-/// Native handle wrapping a Windows HANDLE for D3D12 shared textures.
-/// CEF provides this handle for cross-process texture sharing.
-/// We duplicate the handle to keep it valid after CEF's on_accelerated_paint returns.
-pub struct NativeHandle {
-    handle: HANDLE,
-    /// Whether this handle was duplicated and needs to be closed on drop
-    owned: bool,
-}
-
-impl NativeHandle {
-    pub fn as_handle(&self) -> HANDLE {
-        self.handle
-    }
-
-    /// Creates a NativeHandle by duplicating the given handle.
-    /// This ensures the handle remains valid even after CEF closes its copy.
-    pub fn from_handle(handle: *mut c_void) -> Self {
-        let source_handle = HANDLE(handle);
-        if source_handle.is_invalid() {
-            return Self {
-                handle: HANDLE::default(),
-                owned: false,
-            };
-        }
-
-        // Duplicate the handle to keep it valid after CEF's callback returns
-        let mut duplicated_handle = HANDLE::default();
-        let current_process = unsafe { GetCurrentProcess() };
-
-        let result = unsafe {
-            DuplicateHandle(
-                current_process,
-                source_handle,
-                current_process,
-                &mut duplicated_handle,
-                0,
-                false,
-                DUPLICATE_SAME_ACCESS,
-            )
-        };
-
-        if result.is_ok() && !duplicated_handle.is_invalid() {
-            Self {
-                handle: duplicated_handle,
-                owned: true,
-            }
-        } else {
-            godot_warn!(
-                "[AcceleratedOSR/Windows] Failed to duplicate handle, using original (may become invalid)"
-            );
-            Self {
-                handle: source_handle,
-                owned: false,
-            }
-        }
-    }
-}
-
-impl Default for NativeHandle {
-    fn default() -> Self {
-        Self {
-            handle: HANDLE::default(),
-            owned: false,
-        }
-    }
-}
-
-impl Clone for NativeHandle {
-    fn clone(&self) -> Self {
-        if self.handle.is_invalid() {
-            return Self::default();
-        }
-
-        // Duplicate the handle for the clone
-        let mut duplicated_handle = HANDLE::default();
-        let current_process = unsafe { GetCurrentProcess() };
-
-        let result = unsafe {
-            DuplicateHandle(
-                current_process,
-                self.handle,
-                current_process,
-                &mut duplicated_handle,
-                0,
-                false,
-                DUPLICATE_SAME_ACCESS,
-            )
-        };
-
-        if result.is_ok() && !duplicated_handle.is_invalid() {
-            Self {
-                handle: duplicated_handle,
-                owned: true,
-            }
-        } else {
-            // Fallback: share the handle without owning it
-            Self {
-                handle: self.handle,
-                owned: false,
-            }
-        }
-    }
-}
-
-impl Drop for NativeHandle {
-    fn drop(&mut self) {
-        if self.owned && !self.handle.is_invalid() {
-            let _ = unsafe { CloseHandle(self.handle) };
-            self.handle = HANDLE::default();
-        }
-    }
-}
-
-unsafe impl Send for NativeHandle {}
-unsafe impl Sync for NativeHandle {}
-
-impl NativeHandleTrait for NativeHandle {
-    fn is_valid(&self) -> bool {
-        !self.handle.is_invalid()
-    }
-
-    fn from_accelerated_paint_info(info: &AcceleratedPaintInfo) -> Self {
-        Self::from_handle(info.shared_texture_handle)
-    }
-}
-
-/// D3D12 device and resources for importing shared textures from CEF.
-/// Uses Godot's D3D12 device obtained via RenderingDevice::get_driver_resource()
-/// to ensure resource compatibility for GPU copy operations.
 pub struct NativeTextureImporter {
-    /// D3D12 device borrowed from Godot - wrapped in ManuallyDrop to prevent Release
     device: std::mem::ManuallyDrop<ID3D12Device>,
-    /// Command queue borrowed from Godot - wrapped in ManuallyDrop to prevent Release
-    command_queue: std::mem::ManuallyDrop<ID3D12CommandQueue>,
-    /// Command allocator - owned by us
+    command_queue: ID3D12CommandQueue,
     command_allocator: ID3D12CommandAllocator,
-    /// Fence for synchronization - owned by us
     fence: ID3D12Fence,
     fence_value: u64,
     fence_event: HANDLE,
+    pending_copies: std::collections::HashMap<u64, u64>,
+    device_removed_logged: bool,
 }
 
 impl NativeTextureImporter {
@@ -181,30 +45,23 @@ impl NativeTextureImporter {
 
         let device: ID3D12Device = unsafe { ID3D12Device::from_raw(device_ptr as *mut c_void) };
 
-        // Get the command queue from Godot
-        let command_queue_ptr =
-            rd.get_driver_resource(DriverResource::COMMAND_QUEUE, Rid::Invalid, 0);
-
-        let command_queue: ID3D12CommandQueue = if command_queue_ptr != 0 {
-            unsafe { ID3D12CommandQueue::from_raw(command_queue_ptr as *mut c_void) }
-        } else {
-            // Fallback: create our own command queue using Godot's device
-            godot_warn!(
-                "[AcceleratedOSR/Windows] Could not get command queue from Godot, creating one"
-            );
-            let queue_desc = D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                ..Default::default()
-            };
-            unsafe { device.CreateCommandQueue(&queue_desc) }
-                .map_err(|e| {
-                    godot_error!(
-                        "[AcceleratedOSR/Windows] Failed to create command queue: {:?}",
-                        e
-                    )
-                })
-                .ok()?
+        // CRITICAL: Create our OWN command queue instead of using Godot's.
+        // Using Godot's command queue causes synchronization conflicts because:
+        // 1. Godot is also submitting commands to that queue
+        // 2. Our fence signals don't synchronize with Godot's operations
+        // 3. This causes DEVICE_HUNG errors on the second frame
+        let queue_desc = D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+            ..Default::default()
         };
+        let command_queue: ID3D12CommandQueue = unsafe { device.CreateCommandQueue(&queue_desc) }
+            .map_err(|e| {
+                godot_error!(
+                    "[AcceleratedOSR/Windows] Failed to create command queue: {:?}",
+                    e
+                )
+            })
+            .ok()?;
 
         // Create command allocator using Godot's device
         let command_allocator: ID3D12CommandAllocator =
@@ -240,24 +97,39 @@ impl NativeTextureImporter {
 
         Some(Self {
             device: std::mem::ManuallyDrop::new(device),
-            command_queue: std::mem::ManuallyDrop::new(command_queue),
+            command_queue,
             command_allocator,
             fence,
             fence_value: 0,
             fence_event,
+            pending_copies: std::collections::HashMap::new(),
+            device_removed_logged: false,
         })
     }
 
-    /// Import a shared texture handle from CEF into a D3D12 resource.
-    ///
-    /// CEF shares textures via NT handles (created with D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER
-    /// or similar sharing flags). We open this handle to get access to the texture.
+    pub fn check_device_state(&mut self) -> Result<(), String> {
+        let reason = unsafe { self.device.GetDeviceRemovedReason() };
+        if reason.is_ok() {
+            self.device_removed_logged = false;
+            Ok(())
+        } else if !self.device_removed_logged {
+            godot_warn!(
+                "[AcceleratedOSR/Windows] D3D12 device removed: {:?}",
+                reason.err()
+            );
+            self.device_removed_logged = true;
+            Err("D3D12 device removed".into())
+        } else {
+            Err("D3D12 device removed".into())
+        }
+    }
+
     pub fn import_shared_handle(
-        &self,
+        &mut self,
         handle: HANDLE,
         _width: u32,
         _height: u32,
-        format: cef::sys::cef_color_type_t,
+        _format: cef::sys::cef_color_type_t,
     ) -> Result<ID3D12Resource, String> {
         if handle.is_invalid() {
             return Err("Shared handle is invalid".into());
@@ -265,8 +137,25 @@ impl NativeTextureImporter {
 
         // Open the shared handle to get the D3D12 resource
         let mut resource: Option<ID3D12Resource> = None;
-        unsafe { self.device.OpenSharedHandle(handle, &mut resource) }
-            .map_err(|e| format!("Failed to open shared handle: {:?}", e))?;
+        let result = unsafe { self.device.OpenSharedHandle(handle, &mut resource) };
+
+        if let Err(e) = result {
+            let device_reason = unsafe { self.device.GetDeviceRemovedReason() };
+            if !self.device_removed_logged {
+                if device_reason.is_err() {
+                    godot_warn!(
+                        "[AcceleratedOSR/Windows] Device removed: {:?}",
+                        device_reason.err()
+                    );
+                } else {
+                    godot_warn!("[AcceleratedOSR/Windows] OpenSharedHandle failed: {:?}", e);
+                }
+                self.device_removed_logged = true;
+            }
+            return Err("D3D12 device removed".into());
+        }
+
+        self.device_removed_logged = false;
 
         let resource =
             resource.ok_or_else(|| "OpenSharedHandle returned null resource".to_string())?;
@@ -283,13 +172,24 @@ impl NativeTextureImporter {
         Ok(resource)
     }
 
-    /// Copies from a source D3D12 resource to a destination D3D12 resource.
-    pub fn copy_texture(
+    pub fn queue_copy_texture(
         &mut self,
         src_resource: &ID3D12Resource,
         dst_resource: &ID3D12Resource,
-    ) -> Result<(), String> {
-        // Reset command allocator
+    ) -> Result<u64, String> {
+        // Wait for previous copy before reusing command allocator
+        if self.fence_value > 0 {
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed < self.fence_value {
+                unsafe {
+                    self.fence
+                        .SetEventOnCompletion(self.fence_value, self.fence_event)
+                }
+                .map_err(|e| format!("Failed to set event on completion: {:?}", e))?;
+                unsafe { WaitForSingleObject(self.fence_event, INFINITE) };
+            }
+        }
+
         unsafe { self.command_allocator.Reset() }
             .map_err(|e| format!("Failed to reset command allocator: {:?}", e))?;
 
@@ -304,21 +204,15 @@ impl NativeTextureImporter {
         }
         .map_err(|e| format!("Failed to create command list: {:?}", e))?;
 
-        // Transition source to COPY_SOURCE state
-        let src_barrier = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                    pResource: unsafe { std::mem::transmute_copy(src_resource) },
-                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    StateBefore: D3D12_RESOURCE_STATE_COMMON,
-                    StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
-                }),
-            },
-        };
-
-        // Transition destination to COPY_DEST state
+        // Transition only the destination to COPY_DEST.
+        //
+        // The source texture is created and fully managed by CEF. CEF keeps the
+        // resource in a state suitable for external consumers (typically COMMON)
+        // and expects clients not to perform their own state transitions on it.
+        // The previous implementation transitioned the source to COPY_SOURCE and
+        // back to COMMON, but that interfered with CEF's own resource state
+        // tracking. We now rely on CEF's guarantees and leave the source state
+        // untouched, transitioning just our destination resource for the copy.
         let dst_barrier = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -332,26 +226,10 @@ impl NativeTextureImporter {
             },
         };
 
-        let barriers_before = [src_barrier, dst_barrier];
-        unsafe { command_list.ResourceBarrier(&barriers_before) };
-
-        // Copy the resource
+        unsafe { command_list.ResourceBarrier(&[dst_barrier]) };
         unsafe { command_list.CopyResource(dst_resource, src_resource) };
 
-        // Transition resources back to COMMON state
-        let src_barrier_after = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                    pResource: unsafe { std::mem::transmute_copy(src_resource) },
-                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    StateBefore: D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    StateAfter: D3D12_RESOURCE_STATE_COMMON,
-                }),
-            },
-        };
-
+        // Transition back to COMMON for shader read
         let dst_barrier_after = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -365,8 +243,7 @@ impl NativeTextureImporter {
             },
         };
 
-        let barriers_after = [src_barrier_after, dst_barrier_after];
-        unsafe { command_list.ResourceBarrier(&barriers_after) };
+        unsafe { command_list.ResourceBarrier(&[dst_barrier_after]) };
 
         // Close and execute command list
         unsafe { command_list.Close() }
@@ -379,34 +256,59 @@ impl NativeTextureImporter {
         )];
         unsafe { self.command_queue.ExecuteCommandLists(&command_lists) };
 
-        // Signal and wait for completion
         self.fence_value += 1;
         unsafe { self.command_queue.Signal(&self.fence, self.fence_value) }
             .map_err(|e| format!("Failed to signal fence: {:?}", e))?;
 
-        if unsafe { self.fence.GetCompletedValue() } < self.fence_value {
-            unsafe {
-                self.fence
-                    .SetEventOnCompletion(self.fence_value, self.fence_event)
-            }
-            .map_err(|e| format!("Failed to set event on completion: {:?}", e))?;
-            unsafe { WaitForSingleObject(self.fence_event, INFINITE) };
+        let copy_id = self.fence_value;
+        self.pending_copies.insert(copy_id, self.fence_value);
+
+        Ok(copy_id)
+    }
+
+    pub fn is_copy_complete(&self, copy_id: u64) -> bool {
+        let completed_value = unsafe { self.fence.GetCompletedValue() };
+        copy_id <= completed_value
+    }
+
+    pub fn wait_for_all_copies(&self) {
+        if self.fence_value == 0 {
+            return;
         }
 
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed < self.fence_value {
+            let result = unsafe {
+                self.fence
+                    .SetEventOnCompletion(self.fence_value, self.fence_event)
+            };
+            if result.is_ok() {
+                unsafe { WaitForSingleObject(self.fence_event, INFINITE) };
+            }
+        }
+    }
+
+    pub fn wait_for_copy(&self, copy_id: u64) -> Result<(), String> {
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        if completed >= copy_id {
+            return Ok(());
+        }
+
+        unsafe { self.fence.SetEventOnCompletion(copy_id, self.fence_event) }
+            .map_err(|e| format!("Failed to set event on completion: {:?}", e))?;
+
+        unsafe { WaitForSingleObject(self.fence_event, INFINITE) };
         Ok(())
     }
 }
 
-/// Imports D3D12 shared textures from CEF into Godot's rendering system.
 pub struct GodotTextureImporter {
     d3d12_importer: NativeTextureImporter,
     current_texture_rid: Option<Rid>,
 }
 
-impl TextureImporterTrait for GodotTextureImporter {
-    type Handle = NativeHandle;
-
-    fn new() -> Option<Self> {
+impl GodotTextureImporter {
+    pub fn new() -> Option<Self> {
         let d3d12_importer = NativeTextureImporter::new()?;
         let render_backend = RenderBackend::detect();
 
@@ -427,31 +329,33 @@ impl TextureImporterTrait for GodotTextureImporter {
         })
     }
 
-    fn copy_texture(
+    pub fn import_and_copy(
         &mut self,
-        src_info: &SharedTextureInfo<Self::Handle>,
+        info: &cef::AcceleratedPaintInfo,
         dst_rd_rid: Rid,
-    ) -> Result<(), String> {
-        let handle = src_info.native_handle().as_handle();
+    ) -> Result<u64, String> {
+        self.d3d12_importer.check_device_state()?;
+
+        let handle = HANDLE(info.shared_texture_handle);
         if handle.is_invalid() {
             return Err("Source handle is invalid".into());
         }
-        if src_info.width == 0 || src_info.height == 0 {
-            return Err(format!(
-                "Invalid source dimensions: {}x{}",
-                src_info.width, src_info.height
-            ));
+
+        let width = info.extra.coded_size.width as u32;
+        let height = info.extra.coded_size.height as u32;
+
+        if width == 0 || height == 0 {
+            return Err(format!("Invalid source dimensions: {}x{}", width, height));
         }
         if !dst_rd_rid.is_valid() {
             return Err("Destination RID is invalid".into());
         }
 
-        // Import the shared handle into a D3D12 resource (source)
         let src_resource = self.d3d12_importer.import_shared_handle(
             handle,
-            src_info.width,
-            src_info.height,
-            src_info.format,
+            width,
+            height,
+            *info.format.as_ref(),
         )?;
 
         // Get destination D3D12 resource from Godot's RenderingDevice
@@ -469,11 +373,22 @@ impl TextureImporterTrait for GodotTextureImporter {
             unsafe { ID3D12Resource::from_raw(resource_ptr as *mut c_void) }
         };
 
-        self.d3d12_importer
-            .copy_texture(&src_resource, &dst_resource)?;
-        std::mem::forget(dst_resource);
+        // Must wait for copy - D3D12 command lists don't AddRef resources
+        let copy_id = self
+            .d3d12_importer
+            .queue_copy_texture(&src_resource, &dst_resource)?;
 
-        Ok(())
+        self.d3d12_importer.wait_for_copy(copy_id)?;
+        std::mem::forget(dst_resource);
+        Ok(copy_id)
+    }
+
+    pub fn is_copy_complete(&self, copy_id: u64) -> bool {
+        self.d3d12_importer.is_copy_complete(copy_id)
+    }
+
+    pub fn wait_for_all_copies(&self) {
+        self.d3d12_importer.wait_for_all_copies()
     }
 }
 
@@ -482,17 +397,13 @@ impl Drop for NativeTextureImporter {
         if !self.fence_event.is_invalid() {
             let _ = unsafe { CloseHandle(self.fence_event) };
         }
-        // device and command_queue are ManuallyDrop (borrowed from Godot)
     }
 }
 
 impl Drop for GodotTextureImporter {
     fn drop(&mut self) {
-        let mut rs = RenderingServer::singleton();
-
-        // Free Godot resources
         if let Some(rid) = self.current_texture_rid.take() {
-            rs.free_rid(rid);
+            RenderingServer::singleton().free_rid(rid);
         }
     }
 }
@@ -500,3 +411,6 @@ impl Drop for GodotTextureImporter {
 pub fn is_supported() -> bool {
     NativeTextureImporter::new().is_some() && RenderBackend::detect().supports_accelerated_osr()
 }
+
+unsafe impl Send for GodotTextureImporter {}
+unsafe impl Sync for GodotTextureImporter {}
