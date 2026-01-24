@@ -73,14 +73,24 @@ impl GodotTextureImporter {
         })
     }
 
-    pub fn import_and_copy(
-        &mut self,
-        info: &cef::AcceleratedPaintInfo,
-        dst_rd_rid: Rid,
-    ) -> Result<(), String> {
+    pub fn queue_copy(&mut self, info: &cef::AcceleratedPaintInfo) -> Result<(), String> {
         match &mut self.backend {
-            TextureImporterBackend::D3D12(importer) => importer.import_and_copy(info, dst_rd_rid),
-            TextureImporterBackend::Vulkan(importer) => importer.import_and_copy(info, dst_rd_rid),
+            TextureImporterBackend::D3D12(importer) => importer.queue_copy(info),
+            TextureImporterBackend::Vulkan(importer) => importer.queue_copy(info),
+        }
+    }
+
+    pub fn process_pending_copy(&mut self, dst_rd_rid: Rid) -> Result<(), String> {
+        match &mut self.backend {
+            TextureImporterBackend::D3D12(importer) => importer.process_pending_copy(dst_rd_rid),
+            TextureImporterBackend::Vulkan(importer) => importer.process_pending_copy(dst_rd_rid),
+        }
+    }
+
+    pub fn wait_for_copy(&mut self) -> Result<(), String> {
+        match &mut self.backend {
+            TextureImporterBackend::D3D12(importer) => importer.wait_for_copy(),
+            TextureImporterBackend::Vulkan(importer) => importer.wait_for_copy(),
         }
     }
 }

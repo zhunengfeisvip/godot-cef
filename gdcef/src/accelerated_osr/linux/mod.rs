@@ -46,12 +46,16 @@ impl GodotTextureImporter {
         }
     }
 
-    pub fn import_and_copy(
-        &mut self,
-        info: &AcceleratedPaintInfo,
-        dst_rd_rid: Rid,
-    ) -> Result<(), String> {
-        self.vulkan_importer.import_and_copy(info, dst_rd_rid)
+    pub fn queue_copy(&mut self, info: &AcceleratedPaintInfo) -> Result<(), String> {
+        self.vulkan_importer.queue_copy(info)
+    }
+
+    pub fn process_pending_copy(&mut self, dst_rd_rid: Rid) -> Result<(), String> {
+        self.vulkan_importer.process_pending_copy(dst_rd_rid)
+    }
+
+    pub fn wait_for_copy(&mut self) -> Result<(), String> {
+        self.vulkan_importer.wait_for_copy()
     }
 }
 

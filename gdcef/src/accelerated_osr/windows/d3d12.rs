@@ -3,7 +3,7 @@ use godot::classes::rendering_device::DriverResource;
 use godot::global::{godot_error, godot_print, godot_warn};
 use godot::prelude::*;
 use std::ffi::c_void;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_RESOURCE_BARRIER,
     D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
@@ -12,8 +12,48 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_TRANSITION_BARRIER, ID3D12CommandAllocator,
     ID3D12CommandQueue, ID3D12Device, ID3D12Fence, ID3D12GraphicsCommandList, ID3D12Resource,
 };
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, INFINITE, WaitForSingleObject,
+};
 use windows::core::Interface;
+
+pub struct PendingD3D12Copy {
+    duplicated_handle: HANDLE,
+    width: u32,
+    height: u32,
+}
+
+impl Drop for PendingD3D12Copy {
+    fn drop(&mut self) {
+        if !self.duplicated_handle.is_invalid() {
+            let _ = unsafe { CloseHandle(self.duplicated_handle) };
+        }
+    }
+}
+
+struct ImportedD3D12Resource {
+    duplicated_handle: HANDLE,
+    #[allow(dead_code)]
+    resource: ID3D12Resource,
+}
+
+fn duplicate_win32_handle(handle: HANDLE) -> Result<HANDLE, String> {
+    let mut duplicated = HANDLE::default();
+    let current_process = unsafe { GetCurrentProcess() };
+    unsafe {
+        DuplicateHandle(
+            current_process,
+            handle,
+            current_process,
+            &mut duplicated,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+        .map_err(|e| format!("DuplicateHandle failed: {:?}", e))?;
+    }
+    Ok(duplicated)
+}
 
 pub struct D3D12TextureImporter {
     device: std::mem::ManuallyDrop<ID3D12Device>,
@@ -23,6 +63,9 @@ pub struct D3D12TextureImporter {
     fence_value: u64,
     fence_event: HANDLE,
     device_removed_logged: bool,
+    pending_copy: Option<PendingD3D12Copy>,
+    imported_resource: Option<ImportedD3D12Resource>,
+    copy_in_flight: bool,
 }
 
 impl D3D12TextureImporter {
@@ -101,6 +144,9 @@ impl D3D12TextureImporter {
             fence_value: 0,
             fence_event,
             device_removed_logged: false,
+            pending_copy: None,
+            imported_resource: None,
+            copy_in_flight: false,
         })
     }
 
@@ -169,8 +215,124 @@ impl D3D12TextureImporter {
         Ok(resource)
     }
 
-    /// Copies the source texture to the destination texture synchronously.
-    pub fn copy_texture(
+    pub fn queue_copy(&mut self, info: &cef::AcceleratedPaintInfo) -> Result<(), String> {
+        let handle = HANDLE(info.shared_texture_handle);
+        if handle.is_invalid() {
+            return Err("Source handle is invalid".into());
+        }
+
+        let width = info.extra.coded_size.width as u32;
+        let height = info.extra.coded_size.height as u32;
+
+        if width == 0 || height == 0 {
+            return Err(format!("Invalid source dimensions: {}x{}", width, height));
+        }
+
+        // Duplicate the handle so we own it - this is fast and non-blocking
+        let duplicated_handle = duplicate_win32_handle(handle)?;
+
+        // Replace any existing pending copy (drop the old one, which closes its handle)
+        self.pending_copy = Some(PendingD3D12Copy {
+            duplicated_handle,
+            width,
+            height,
+        });
+
+        Ok(())
+    }
+
+    pub fn process_pending_copy(&mut self, dst_rd_rid: Rid) -> Result<(), String> {
+        self.check_device_state()?;
+
+        let pending = match self.pending_copy.take() {
+            Some(p) => p,
+            None => return Ok(()), // Nothing to do
+        };
+
+        if !dst_rd_rid.is_valid() {
+            return Err("Destination RID is invalid".into());
+        }
+
+        // Wait for any previous in-flight copy to complete before reusing resources
+        if self.copy_in_flight {
+            self.wait_for_copy()?;
+            self.copy_in_flight = false;
+        }
+
+        // Free previous imported resource
+        self.free_imported_resource();
+
+        // Import the resource using our duplicated handle
+        let src_resource = match self.import_shared_handle(
+            pending.duplicated_handle,
+            pending.width,
+            pending.height,
+            cef::sys::cef_color_type_t::CEF_COLOR_TYPE_BGRA_8888,
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                // pending will be dropped here, closing its handle
+                return Err(e);
+            }
+        };
+
+        // Get destination D3D12 resource from Godot's RenderingDevice
+        let dst_resource = {
+            let mut rd = RenderingServer::singleton()
+                .get_rendering_device()
+                .ok_or("Failed to get RenderingDevice")?;
+
+            let resource_ptr = rd.get_driver_resource(DriverResource::TEXTURE, dst_rd_rid, 0);
+
+            if resource_ptr == 0 {
+                return Err("Failed to get destination D3D12 resource handle".into());
+            }
+
+            unsafe { ID3D12Resource::from_raw(resource_ptr as *mut c_void) }
+        };
+
+        // Submit copy command (non-blocking)
+        self.submit_copy_async(&src_resource, &dst_resource)?;
+        self.copy_in_flight = true;
+
+        // Don't drop dst_resource - it's owned by Godot
+        std::mem::forget(dst_resource);
+
+        // Store the imported resource (keeps it alive for the GPU operation)
+        // Transfer handle ownership from pending to imported_resource
+        self.imported_resource = Some(ImportedD3D12Resource {
+            duplicated_handle: pending.duplicated_handle,
+            resource: src_resource,
+        });
+
+        // Prevent pending's Drop from closing the handle (we transferred ownership)
+        std::mem::forget(pending);
+
+        Ok(())
+    }
+
+    pub fn wait_for_copy(&mut self) -> Result<(), String> {
+        if !self.copy_in_flight {
+            return Ok(());
+        }
+
+        if self.fence_value > 0 {
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed < self.fence_value {
+                unsafe {
+                    self.fence
+                        .SetEventOnCompletion(self.fence_value, self.fence_event)
+                }
+                .map_err(|e| format!("Failed to set event on completion: {:?}", e))?;
+                unsafe { WaitForSingleObject(self.fence_event, INFINITE) };
+            }
+        }
+
+        self.copy_in_flight = false;
+        Ok(())
+    }
+
+    fn submit_copy_async(
         &mut self,
         src_resource: &ID3D12Resource,
         dst_resource: &ID3D12Resource,
@@ -203,14 +365,6 @@ impl D3D12TextureImporter {
         .map_err(|e| format!("Failed to create command list: {:?}", e))?;
 
         // Transition only the destination to COPY_DEST.
-        //
-        // The source texture is created and fully managed by CEF. CEF keeps the
-        // resource in a state suitable for external consumers (typically COMMON)
-        // and expects clients not to perform their own state transitions on it.
-        // The previous implementation transitioned the source to COPY_SOURCE and
-        // back to COMMON, but that interfered with CEF's own resource state
-        // tracking. We now rely on CEF's guarantees and leave the source state
-        // untouched, transitioning just our destination resource for the copy.
         let dst_barrier = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -258,67 +412,26 @@ impl D3D12TextureImporter {
         unsafe { self.command_queue.Signal(&self.fence, self.fence_value) }
             .map_err(|e| format!("Failed to signal fence: {:?}", e))?;
 
-        // Wait for the copy to complete
-        unsafe {
-            self.fence
-                .SetEventOnCompletion(self.fence_value, self.fence_event)
-        }
-        .map_err(|e| format!("Failed to set event on completion: {:?}", e))?;
-        unsafe { WaitForSingleObject(self.fence_event, INFINITE) };
-
+        // NOTE: We do NOT wait here - the caller should call wait_for_copy() when needed
         Ok(())
     }
 
-    /// Import and copy a texture from CEF to Godot's RenderingDevice texture.
-    pub fn import_and_copy(
-        &mut self,
-        info: &cef::AcceleratedPaintInfo,
-        dst_rd_rid: Rid,
-    ) -> Result<(), String> {
-        self.check_device_state()?;
-
-        let handle = HANDLE(info.shared_texture_handle);
-        if handle.is_invalid() {
-            return Err("Source handle is invalid".into());
+    fn free_imported_resource(&mut self) {
+        if let Some(imported) = self.imported_resource.take() {
+            let _ = unsafe { CloseHandle(imported.duplicated_handle) };
         }
-
-        let width = info.extra.coded_size.width as u32;
-        let height = info.extra.coded_size.height as u32;
-
-        if width == 0 || height == 0 {
-            return Err(format!("Invalid source dimensions: {}x{}", width, height));
-        }
-        if !dst_rd_rid.is_valid() {
-            return Err("Destination RID is invalid".into());
-        }
-
-        let src_resource =
-            self.import_shared_handle(handle, width, height, *info.format.as_ref())?;
-
-        // Get destination D3D12 resource from Godot's RenderingDevice
-        let dst_resource = {
-            let mut rd = RenderingServer::singleton()
-                .get_rendering_device()
-                .ok_or("Failed to get RenderingDevice")?;
-
-            let resource_ptr = rd.get_driver_resource(DriverResource::TEXTURE, dst_rd_rid, 0);
-
-            if resource_ptr == 0 {
-                return Err("Failed to get destination D3D12 resource handle".into());
-            }
-
-            unsafe { ID3D12Resource::from_raw(resource_ptr as *mut c_void) }
-        };
-
-        self.copy_texture(&src_resource, &dst_resource)?;
-
-        std::mem::forget(dst_resource);
-        Ok(())
     }
 }
 
 impl Drop for D3D12TextureImporter {
     fn drop(&mut self) {
+        if self.copy_in_flight {
+            let _ = self.wait_for_copy();
+        }
+
+        self.pending_copy = None;
+        self.free_imported_resource();
+
         if !self.fence_event.is_invalid() {
             let _ = unsafe { CloseHandle(self.fence_event) };
         }

@@ -3,7 +3,8 @@ use godot::classes::RenderingServer;
 use godot::classes::rendering_device::DriverResource;
 use godot::global::{godot_error, godot_print};
 use godot::prelude::*;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+use windows::Win32::System::Threading::GetCurrentProcess;
 
 type PfnVkGetMemoryWin32HandlePropertiesKHR = unsafe extern "system" fn(
     device: vk::Device,
@@ -12,25 +13,39 @@ type PfnVkGetMemoryWin32HandlePropertiesKHR = unsafe extern "system" fn(
     p_memory_win32_handle_properties: *mut vk::MemoryWin32HandlePropertiesKHR<'_>,
 ) -> vk::Result;
 
-const FRAME_BUFFER_COUNT: usize = 2;
+pub struct PendingVulkanCopy {
+    duplicated_handle: HANDLE,
+    width: u32,
+    height: u32,
+}
+
+impl Drop for PendingVulkanCopy {
+    fn drop(&mut self) {
+        if !self.duplicated_handle.is_invalid() {
+            let _ = unsafe { CloseHandle(self.duplicated_handle) };
+        }
+    }
+}
 
 pub struct VulkanTextureImporter {
     device: vk::Device,
     command_pool: vk::CommandPool,
-    command_buffers: [vk::CommandBuffer; FRAME_BUFFER_COUNT],
-    fences: [vk::Fence; FRAME_BUFFER_COUNT],
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
     queue: vk::Queue,
-    current_frame: usize,
+    queue_family_index: u32,
+    uses_separate_queue: bool,
     get_memory_win32_handle_properties: PfnVkGetMemoryWin32HandlePropertiesKHR,
     cached_memory_type_index: Option<u32>,
     imported_image: Option<ImportedVulkanImage>,
+    pending_copy: Option<PendingVulkanCopy>,
+    copy_in_flight: bool,
 }
 
 struct ImportedVulkanImage {
-    handle_value: isize,
+    duplicated_handle: HANDLE,
     image: vk::Image,
     memory: vk::DeviceMemory,
-    extent: vk::Extent2D,
 }
 
 struct VulkanFunctions {
@@ -57,6 +72,24 @@ struct VulkanFunctions {
 }
 
 static VULKAN_FNS: std::sync::OnceLock<VulkanFunctions> = std::sync::OnceLock::new();
+
+fn duplicate_win32_handle(handle: HANDLE) -> Result<HANDLE, String> {
+    let mut duplicated = HANDLE::default();
+    let current_process = unsafe { GetCurrentProcess() };
+    unsafe {
+        DuplicateHandle(
+            current_process,
+            handle,
+            current_process,
+            &mut duplicated,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+        .map_err(|e| format!("DuplicateHandle failed: {:?}", e))?;
+    }
+    Ok(duplicated)
+}
 
 impl VulkanTextureImporter {
     pub fn new() -> Option<Self> {
@@ -87,20 +120,41 @@ impl VulkanTextureImporter {
         // Load function pointers using the device
         let fns = VULKAN_FNS.get_or_init(|| Self::load_vulkan_functions(&lib, device));
 
-        // We need to find the physical device. Use the queue to infer it's valid.
-        // Godot uses queue family 0 for graphics by default.
-        let queue_family_index = 0u32;
+        // Get physical device from Godot to query queue families
+        let physical_device_ptr =
+            rd.get_driver_resource(DriverResource::PHYSICAL_DEVICE, Rid::Invalid, 0);
+        let physical_device: vk::PhysicalDevice = if physical_device_ptr != 0 {
+            unsafe { std::mem::transmute::<u64, vk::PhysicalDevice>(physical_device_ptr) }
+        } else {
+            vk::PhysicalDevice::null()
+        };
+
+        // Try to find a separate queue for our copy operations
+        // This avoids synchronization issues with Godot's main graphics queue
+        let (queue_family_index, queue_index, uses_separate_queue) =
+            Self::find_copy_queue(&lib, physical_device, fns);
+
         let mut queue: vk::Queue = unsafe { std::mem::zeroed() };
         unsafe {
-            (fns.get_device_queue)(device, queue_family_index, 0, &mut queue);
+            (fns.get_device_queue)(device, queue_family_index, queue_index, &mut queue);
         }
 
         if queue == vk::Queue::null() {
-            godot_error!("[AcceleratedOSR/Vulkan] Failed to get graphics queue");
+            // Fall back to queue 0 if our preferred queue isn't available
+            godot_print!(
+                "[AcceleratedOSR/Vulkan] Preferred queue not available, falling back to queue 0"
+            );
+            unsafe {
+                (fns.get_device_queue)(device, 0, 0, &mut queue);
+            }
+        }
+
+        if queue == vk::Queue::null() {
+            godot_error!("[AcceleratedOSR/Vulkan] Failed to get any Vulkan queue");
             return None;
         }
 
-        // Create command pool
+        // Create command pool for our queue family
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -117,20 +171,18 @@ impl VulkanTextureImporter {
             return None;
         }
 
-        // Allocate double-buffered command buffers
+        // Allocate command buffer
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(FRAME_BUFFER_COUNT as u32);
+            .command_buffer_count(1);
 
-        let mut command_buffers: [vk::CommandBuffer; FRAME_BUFFER_COUNT] =
-            unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            (fns.allocate_command_buffers)(device, &alloc_info, command_buffers.as_mut_ptr())
-        };
+        let mut command_buffer: vk::CommandBuffer = unsafe { std::mem::zeroed() };
+        let result =
+            unsafe { (fns.allocate_command_buffers)(device, &alloc_info, &mut command_buffer) };
         if result != vk::Result::SUCCESS {
             godot_error!(
-                "[AcceleratedOSR/Vulkan] Failed to allocate command buffers: {:?}",
+                "[AcceleratedOSR/Vulkan] Failed to allocate command buffer: {:?}",
                 result
             );
             unsafe {
@@ -139,47 +191,50 @@ impl VulkanTextureImporter {
             return None;
         }
 
-        // Create double-buffered fences (start signaled so first wait doesn't block)
+        // Create fence (start signaled so first reset doesn't fail)
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-        let mut fences: [vk::Fence; FRAME_BUFFER_COUNT] = unsafe { std::mem::zeroed() };
-        for i in 0..FRAME_BUFFER_COUNT {
-            let result = unsafe {
-                (fns.create_fence)(device, &fence_info, std::ptr::null(), &mut fences[i])
-            };
-            if result != vk::Result::SUCCESS {
-                godot_error!(
-                    "[AcceleratedOSR/Vulkan] Failed to create fence: {:?}",
-                    result
-                );
-                for fence in fences.iter().take(i) {
-                    unsafe {
-                        (fns.destroy_fence)(device, *fence, std::ptr::null());
-                    }
-                }
-                unsafe {
-                    (fns.destroy_command_pool)(device, command_pool, std::ptr::null());
-                }
-                return None;
+        let mut fence: vk::Fence = unsafe { std::mem::zeroed() };
+        let result =
+            unsafe { (fns.create_fence)(device, &fence_info, std::ptr::null(), &mut fence) };
+        if result != vk::Result::SUCCESS {
+            godot_error!(
+                "[AcceleratedOSR/Vulkan] Failed to create fence: {:?}",
+                result
+            );
+            unsafe {
+                (fns.destroy_command_pool)(device, command_pool, std::ptr::null());
             }
+            return None;
         }
 
         // Keep library loaded for the lifetime of the importer
         std::mem::forget(lib);
 
-        godot_print!(
-            "[AcceleratedOSR/Vulkan] Using Godot's Vulkan device for accelerated OSR (double-buffered)"
-        );
+        if uses_separate_queue {
+            godot_print!(
+                "[AcceleratedOSR/Vulkan] Using separate queue (family={}, index={}) for texture copies",
+                queue_family_index,
+                queue_index
+            );
+        } else {
+            godot_print!(
+                "[AcceleratedOSR/Vulkan] Using shared graphics queue - may have sync issues under load"
+            );
+        }
 
         Some(Self {
             device,
             command_pool,
-            command_buffers,
+            command_buffer,
             queue,
-            fences,
-            current_frame: 0,
+            queue_family_index,
+            uses_separate_queue,
+            fence,
             get_memory_win32_handle_properties: fns.get_memory_win32_handle_properties,
             cached_memory_type_index: None,
             imported_image: None,
+            pending_copy: None,
+            copy_in_flight: false,
         })
     }
 
@@ -253,20 +308,88 @@ impl VulkanTextureImporter {
         }
     }
 
-    pub fn import_and_copy(
-        &mut self,
-        info: &cef::AcceleratedPaintInfo,
-        dst_rd_rid: Rid,
-    ) -> Result<(), String> {
-        let fns = VULKAN_FNS.get().ok_or("Vulkan functions not loaded")?;
+    fn find_copy_queue(
+        lib: &libloading::Library,
+        physical_device: vk::PhysicalDevice,
+        _fns: &VulkanFunctions,
+    ) -> (u32, u32, bool) {
+        // Default to Godot's graphics queue (family 0, queue 0)
+        let default = (0u32, 0u32, false);
 
-        // Get current frame index and wait for its previous use to complete
-        let frame_idx = self.current_frame;
-        let fence = self.fences[frame_idx];
+        if physical_device == vk::PhysicalDevice::null() {
+            return default;
+        }
 
-        // Wait for THIS frame's previous use to complete (allows other frame to be in-flight)
-        let _ = unsafe { (fns.wait_for_fences)(self.device, 1, &fence, vk::TRUE, u64::MAX) };
+        // Load instance function to query queue families
+        type GetPhysicalDeviceQueueFamilyProperties = unsafe extern "system" fn(
+            physical_device: vk::PhysicalDevice,
+            p_queue_family_property_count: *mut u32,
+            p_queue_family_properties: *mut vk::QueueFamilyProperties,
+        );
 
+        let get_queue_family_props: GetPhysicalDeviceQueueFamilyProperties = unsafe {
+            match lib.get(b"vkGetPhysicalDeviceQueueFamilyProperties\0") {
+                Ok(f) => *f,
+                Err(_) => return default,
+            }
+        };
+
+        // Query number of queue families
+        let mut family_count: u32 = 0;
+        unsafe {
+            get_queue_family_props(physical_device, &mut family_count, std::ptr::null_mut());
+        }
+
+        if family_count == 0 {
+            return default;
+        }
+
+        // Get queue family properties
+        let mut family_props = vec![vk::QueueFamilyProperties::default(); family_count as usize];
+        unsafe {
+            get_queue_family_props(
+                physical_device,
+                &mut family_count,
+                family_props.as_mut_ptr(),
+            );
+        }
+
+        // Strategy 1: Try to get queue index 1 from graphics family (family 0)
+        // Many GPUs have multiple queues in the graphics family
+        if !family_props.is_empty() && family_props[0].queue_count > 1 {
+            // Try queue index 1 in graphics family
+            godot_print!(
+                "[AcceleratedOSR/Vulkan] Graphics family has {} queues, trying queue index 1",
+                family_props[0].queue_count
+            );
+            return (0, 1, true);
+        }
+
+        // Strategy 2: Find a dedicated transfer queue family
+        for (idx, props) in family_props.iter().enumerate() {
+            let has_transfer = props.queue_flags.contains(vk::QueueFlags::TRANSFER);
+            let has_graphics = props.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+            let has_compute = props.queue_flags.contains(vk::QueueFlags::COMPUTE);
+
+            // Prefer a transfer-only or transfer+compute family (not graphics)
+            if has_transfer && !has_graphics && props.queue_count > 0 {
+                godot_print!(
+                    "[AcceleratedOSR/Vulkan] Found dedicated transfer queue family {} (compute={})",
+                    idx,
+                    has_compute
+                );
+                return (idx as u32, 0, true);
+            }
+        }
+
+        // Strategy 3: Fall back to graphics queue 0
+        godot_print!(
+            "[AcceleratedOSR/Vulkan] No separate queue available, using shared graphics queue"
+        );
+        default
+    }
+
+    pub fn queue_copy(&mut self, info: &cef::AcceleratedPaintInfo) -> Result<(), String> {
         let handle = HANDLE(info.shared_texture_handle);
         if handle.is_invalid() {
             return Err("Source handle is invalid".into());
@@ -278,12 +401,42 @@ impl VulkanTextureImporter {
         if width == 0 || height == 0 {
             return Err(format!("Invalid source dimensions: {}x{}", width, height));
         }
+
+        // Duplicate the handle so we own it - this is fast and non-blocking
+        let duplicated_handle = duplicate_win32_handle(handle)?;
+
+        // Replace any existing pending copy (drop the old one, which closes its handle)
+        self.pending_copy = Some(PendingVulkanCopy {
+            duplicated_handle,
+            width,
+            height,
+        });
+
+        Ok(())
+    }
+
+    pub fn process_pending_copy(&mut self, dst_rd_rid: Rid) -> Result<(), String> {
+        let pending = match self.pending_copy.take() {
+            Some(p) => p,
+            None => return Ok(()), // Nothing to do
+        };
+
         if !dst_rd_rid.is_valid() {
             return Err("Destination RID is invalid".into());
         }
 
+        // Wait for any previous in-flight copy to complete before reusing resources
+        if self.copy_in_flight {
+            self.wait_for_copy()?;
+            self.copy_in_flight = false;
+        }
+
         // Import the D3D12 handle as a Vulkan image
-        let src_image = self.import_handle_to_image(handle, width, height)?;
+        let src_image = self.import_handle_to_image_from_duplicated(
+            pending.duplicated_handle,
+            pending.width,
+            pending.height,
+        )?;
 
         // Get destination Vulkan image from Godot's RenderingDevice
         let dst_image: vk::Image = {
@@ -299,35 +452,42 @@ impl VulkanTextureImporter {
             unsafe { std::mem::transmute(image_ptr) }
         };
 
-        // Copy from imported image to Godot's texture
-        self.submit_copy(src_image, dst_image, width, height, frame_idx)?;
+        // Submit copy command (non-blocking GPU submission)
+        self.submit_copy_async(src_image, dst_image, pending.width, pending.height)?;
+        self.copy_in_flight = true;
 
-        // Advance to next frame for double buffering
-        self.current_frame = (self.current_frame + 1) % FRAME_BUFFER_COUNT;
+        // Note: We don't close pending.duplicated_handle here because it's now
+        // stored in self.imported_image and will be closed when that's freed.
+        // We need to prevent the Drop impl from closing it.
+        std::mem::forget(pending);
 
         Ok(())
     }
 
-    fn import_handle_to_image(
+    pub fn wait_for_copy(&mut self) -> Result<(), String> {
+        if !self.copy_in_flight {
+            return Ok(());
+        }
+
+        let fns = VULKAN_FNS.get().ok_or("Vulkan functions not loaded")?;
+        let result =
+            unsafe { (fns.wait_for_fences)(self.device, 1, &self.fence, vk::TRUE, u64::MAX) };
+        if result != vk::Result::SUCCESS {
+            return Err(format!("Failed to wait for fence: {:?}", result));
+        }
+        self.copy_in_flight = false;
+        Ok(())
+    }
+
+    fn import_handle_to_image_from_duplicated(
         &mut self,
-        handle: HANDLE,
+        duplicated_handle: HANDLE,
         width: u32,
         height: u32,
     ) -> Result<vk::Image, String> {
         let fns = VULKAN_FNS.get().ok_or("Vulkan functions not loaded")?;
-        let extent = vk::Extent2D { width, height };
-        let handle_value = handle.0 as isize;
 
-        // Check if we can fully reuse existing import (same handle AND dimensions)
-        if let Some(existing) = &self.imported_image
-            && existing.handle_value == handle_value
-            && existing.extent == extent
-        {
-            // Cache hit! Reuse everything
-            return Ok(existing.image);
-        }
-
-        // Cache miss - must create new image (VkImage can only be bound once)
+        // Always free previous image - we get a new handle every frame
         self.free_imported_image();
 
         // Create new image with external memory flag
@@ -358,14 +518,21 @@ impl VulkanTextureImporter {
             return Err(format!("Failed to create image: {:?}", result));
         }
 
-        // Import memory for this handle
-        let memory = self.import_memory_for_image(handle, image, width, height)?;
+        // Import memory using the duplicated handle
+        let memory = match self.import_memory_for_image(duplicated_handle, image, width, height) {
+            Ok(mem) => mem,
+            Err(e) => {
+                unsafe {
+                    (fns.destroy_image)(self.device, image, std::ptr::null());
+                }
+                return Err(e);
+            }
+        };
 
         self.imported_image = Some(ImportedVulkanImage {
-            handle_value,
+            duplicated_handle,
             image,
             memory,
-            extent,
         });
         Ok(image)
     }
@@ -448,20 +615,19 @@ impl VulkanTextureImporter {
         Some(type_filter.trailing_zeros())
     }
 
-    fn submit_copy(
+    fn submit_copy_async(
         &mut self,
         src: vk::Image,
         dst: vk::Image,
         width: u32,
         height: u32,
-        frame_idx: usize,
     ) -> Result<(), String> {
         let fns = VULKAN_FNS.get().ok_or("Vulkan functions not loaded")?;
 
-        let fence = self.fences[frame_idx];
-        let cmd_buffer = self.command_buffers[frame_idx];
+        let fence = self.fence;
+        let cmd_buffer = self.command_buffer;
 
-        // Reset fence and command buffer for this frame
+        // Reset fence and command buffer
         let _ = unsafe { (fns.reset_fences)(self.device, 1, &fence) };
         let _ =
             unsafe { (fns.reset_command_buffer)(cmd_buffer, vk::CommandBufferResetFlags::empty()) };
@@ -555,11 +721,19 @@ impl VulkanTextureImporter {
         }
 
         // Transition destination to SHADER_READ_ONLY for sampling
+        // If using a different queue family, we need to release ownership
+        let (src_family, dst_family) = if self.uses_separate_queue && self.queue_family_index != 0 {
+            // Release ownership from our transfer queue to graphics queue (family 0)
+            (self.queue_family_index, 0u32)
+        } else {
+            (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
+        };
+
         let final_barrier = vk::ImageMemoryBarrier::default()
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .src_queue_family_index(src_family)
+            .dst_queue_family_index(dst_family)
             .image(dst)
             .subresource_range(subresource_range)
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -582,11 +756,14 @@ impl VulkanTextureImporter {
 
         let _ = unsafe { (fns.end_command_buffer)(cmd_buffer) };
 
-        // Submit without waiting - we'll wait at the start of the next frame's use of this slot
+        // Submit (non-blocking - fence will be signaled when complete)
         let submit_info =
             vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd_buffer));
 
-        let _ = unsafe { (fns.queue_submit)(self.queue, 1, &submit_info, fence) };
+        let result = unsafe { (fns.queue_submit)(self.queue, 1, &submit_info, fence) };
+        if result != vk::Result::SUCCESS {
+            return Err(format!("Failed to submit copy command: {:?}", result));
+        }
 
         Ok(())
     }
@@ -598,6 +775,7 @@ impl VulkanTextureImporter {
             unsafe {
                 (fns.destroy_image)(self.device, img.image, std::ptr::null());
                 (fns.free_memory)(self.device, img.memory, std::ptr::null());
+                let _ = CloseHandle(img.duplicated_handle);
             }
         }
     }
@@ -605,26 +783,17 @@ impl VulkanTextureImporter {
 
 impl Drop for VulkanTextureImporter {
     fn drop(&mut self) {
-        // Wait for all in-flight copies to complete before cleanup
-        if let Some(fns) = VULKAN_FNS.get() {
-            let _ = unsafe {
-                (fns.wait_for_fences)(
-                    self.device,
-                    FRAME_BUFFER_COUNT as u32,
-                    self.fences.as_ptr(),
-                    vk::TRUE,
-                    u64::MAX,
-                )
-            };
+        if self.copy_in_flight {
+            let _ = self.wait_for_copy();
         }
+
+        self.pending_copy = None;
 
         self.free_imported_image();
 
         if let Some(fns) = VULKAN_FNS.get() {
             unsafe {
-                for fence in &self.fences {
-                    (fns.destroy_fence)(self.device, *fence, std::ptr::null());
-                }
+                (fns.destroy_fence)(self.device, self.fence, std::ptr::null());
                 (fns.destroy_command_pool)(self.device, self.command_pool, std::ptr::null());
             }
         }

@@ -85,6 +85,7 @@ pub struct AcceleratedRenderState {
     pub popup_dirty: bool,
     pub popup_has_content: bool,
     pub needs_popup_texture: Option<(u32, u32)>,
+    pub has_pending_copy: bool,
 }
 
 impl AcceleratedRenderState {
@@ -101,7 +102,18 @@ impl AcceleratedRenderState {
             popup_dirty: false,
             popup_has_content: false,
             needs_popup_texture: None,
+            has_pending_copy: false,
         }
+    }
+
+    pub fn process_pending_copy(&mut self) -> Result<(), String> {
+        if !self.has_pending_copy {
+            return Ok(());
+        }
+
+        self.importer.process_pending_copy(self.dst_rd_rid)?;
+        self.has_pending_copy = false;
+        Ok(())
     }
 }
 
@@ -156,8 +168,15 @@ impl AcceleratedRenderHandler {
                 return;
             }
 
+            // For popups, use synchronous copy (they're small and infrequent)
             if let Some(popup_rid) = state.popup_rd_rid {
-                match state.importer.import_and_copy(info, popup_rid) {
+                let result = state
+                    .importer
+                    .queue_copy(info)
+                    .and_then(|_| state.importer.process_pending_copy(popup_rid))
+                    .and_then(|_| state.importer.wait_for_copy());
+
+                match result {
                     Ok(_) => {
                         state.popup_dirty = true;
                         state.popup_has_content = true;
@@ -180,7 +199,8 @@ impl AcceleratedRenderHandler {
         let src_width = info.extra.coded_size.width as u32;
         let src_height = info.extra.coded_size.height as u32;
 
-        // Perform immediate GPU copy while handle is valid
+        // Queue the copy operation for deferred processing
+        // This returns immediately after duplicating the handle
         let Some(render_state_arc) = &self.render_state else {
             return;
         };
@@ -193,20 +213,22 @@ impl AcceleratedRenderHandler {
         // Check if texture dimensions changed - defer resize to main loop
         if src_width != state.dst_width || src_height != state.dst_height {
             state.needs_resize = Some((src_width, src_height));
-            // Can't copy to mismatched texture, skip this frame
-            return;
+            // Note: we still queue the copy below to capture this frame.
+            // The frame will be processed AFTER resize in update_texture().
         }
 
-        // Perform immediate import and copy while handle is guaranteed valid
-        let dst_rid = state.dst_rd_rid;
-        match state.importer.import_and_copy(info, dst_rid) {
-            Ok(_) => {}
+        // Queue the copy operation (fast - just duplicates handle)
+        // The actual GPU work will be done in process_pending_copy()
+        // We queue even during resize to capture the frame - dst_rd_rid will be
+        // passed at processing time after any resize is complete.
+        match state.importer.queue_copy(info) {
+            Ok(_) => {
+                state.has_pending_copy = true;
+            }
             Err(e) => {
-                // Don't spam the log for device removed/suspended errors
-                // (these are logged once by check_device_state)
                 if !e.contains("D3D12 device removed") {
                     godot::global::godot_error!(
-                        "[AcceleratedOSR] Failed to import and copy texture: {}",
+                        "[AcceleratedOSR] Failed to queue texture copy: {}",
                         e
                     );
                 }
@@ -261,11 +283,15 @@ impl GodotTextureImporter {
         None
     }
 
-    pub fn import_and_copy(
-        &mut self,
-        _info: &AcceleratedPaintInfo,
-        _dst_rd_rid: Rid,
-    ) -> Result<(), String> {
+    pub fn queue_copy(&mut self, _info: &AcceleratedPaintInfo) -> Result<(), String> {
+        Err("Accelerated OSR not supported on this platform".to_string())
+    }
+
+    pub fn process_pending_copy(&mut self, _dst_rd_rid: Rid) -> Result<(), String> {
+        Err("Accelerated OSR not supported on this platform".to_string())
+    }
+
+    pub fn wait_for_copy(&mut self) -> Result<(), String> {
         Err("Accelerated OSR not supported on this platform".to_string())
     }
 }

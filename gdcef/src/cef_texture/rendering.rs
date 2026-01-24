@@ -228,7 +228,7 @@ impl CefTexture {
                 return;
             };
 
-            if let Some((new_w, new_h)) = state.needs_resize.take()
+            let texture_to_set = if let Some((new_w, new_h)) = state.needs_resize.take()
                 && new_w > 0
                 && new_h > 0
             {
@@ -248,9 +248,21 @@ impl CefTexture {
                 state.dst_height = new_h;
 
                 *texture_2d_rd = new_texture_2d_rd.clone();
-                drop(state);
+                Some(new_texture_2d_rd)
+            } else {
+                None
+            };
 
-                self.base_mut().set_texture(&new_texture_2d_rd);
+            if state.has_pending_copy
+                && let Err(e) = state.process_pending_copy()
+            {
+                godot::global::godot_error!("[CefTexture] Failed to process pending copy: {}", e);
+            }
+
+            drop(state);
+
+            if let Some(tex) = texture_to_set {
+                self.base_mut().set_texture(&tex);
             }
         }
 
