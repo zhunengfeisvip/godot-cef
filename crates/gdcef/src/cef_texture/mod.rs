@@ -387,6 +387,96 @@ impl CefTexture {
             .unwrap_or(false)
     }
 
+    /// Creates an AudioStreamGenerator configured for this browser's audio.
+    /// Only works when `godot_cef/audio/enable_audio_capture` is enabled.
+    #[func]
+    pub fn create_audio_stream(&self) -> Gd<godot::classes::AudioStreamGenerator> {
+        use godot::classes::AudioStreamGenerator;
+
+        let mut stream = AudioStreamGenerator::new_gd();
+
+        let sample_rate = self
+            .app
+            .audio_sample_rate
+            .as_ref()
+            .and_then(|sr| sr.lock().ok().map(|sr| *sr))
+            .unwrap_or(48000);
+
+        stream.set_mix_rate(sample_rate as f32);
+        stream.set_buffer_length(0.1);
+
+        stream
+    }
+
+    /// Pushes buffered audio data to the given playback. Call every frame.
+    /// Returns the number of frames pushed.
+    #[func]
+    pub fn push_audio_to_playback(
+        &mut self,
+        mut playback: Gd<godot::classes::AudioStreamGeneratorPlayback>,
+    ) -> i32 {
+        let Some(ref queue) = self.app.audio_packet_queue else {
+            return 0;
+        };
+
+        let mut total_frames = 0i32;
+
+        if let Ok(mut queue) = queue.lock() {
+            'outer: while let Some(mut packet) = queue.pop_front() {
+                let mut frame_index = 0;
+                let frame_count = packet.data.len() / 2;
+
+                while frame_index < frame_count {
+                    if playback.can_push_buffer(1) {
+                        let i = frame_index * 2;
+                        let frame = Vector2::new(packet.data[i], packet.data[i + 1]);
+                        playback.push_frame(frame);
+                        total_frames += 1;
+                        frame_index += 1;
+                    } else {
+                        // Playback buffer is full. Re-queue remaining data in this packet
+                        // at the front of the queue so it can be processed next frame.
+                        if frame_index < frame_count {
+                            let samples_consumed = frame_index * 2;
+                            packet.data.drain(..samples_consumed);
+                            queue.push_front(packet);
+                        }
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        total_frames
+    }
+
+    /// Returns true if there is audio data available in the buffer.
+    #[func]
+    pub fn has_audio_data(&self) -> bool {
+        self.app
+            .audio_packet_queue
+            .as_ref()
+            .and_then(|q| q.lock().ok())
+            .is_some_and(|q| !q.is_empty())
+    }
+
+    /// Returns the number of audio packets currently buffered.
+    #[func]
+    pub fn get_audio_buffer_size(&self) -> i32 {
+        self.app
+            .audio_packet_queue
+            .as_ref()
+            .and_then(|q| q.lock().ok())
+            .map(|q| q.len() as i32)
+            .unwrap_or(0)
+    }
+
+    /// Returns true if audio capture mode is enabled in project settings.
+    #[func]
+    pub fn is_audio_capture_enabled(&self) -> bool {
+        crate::settings::is_audio_capture_enabled()
+    }
+
     /// Called when the IME proxy LineEdit text changes during composition.
     #[func]
     fn on_ime_proxy_text_changed(&mut self, new_text: GString) {
