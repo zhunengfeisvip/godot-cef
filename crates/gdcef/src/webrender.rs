@@ -7,16 +7,17 @@ use wide::{i8x16, u8x16};
 use crate::accelerated_osr::PlatformAcceleratedRenderHandler;
 use crate::browser::{
     AudioPacket, AudioPacketQueue, AudioParamsState, AudioSampleRateState, AudioShutdownFlag,
-    ConsoleMessageEvent, ConsoleMessageQueue, DownloadRequestEvent, DownloadRequestQueue,
-    DownloadUpdateEvent, DownloadUpdateQueue, DragDataInfo, DragEvent, DragEventQueue,
-    ImeCompositionQueue, ImeCompositionRange, ImeEnableQueue, LoadingStateEvent, LoadingStateQueue,
-    MessageQueue, TitleChangeQueue, UrlChangeQueue,
+    BinaryMessageQueue, ConsoleMessageEvent, ConsoleMessageQueue, DownloadRequestEvent,
+    DownloadRequestQueue, DownloadUpdateEvent, DownloadUpdateQueue, DragDataInfo, DragEvent,
+    DragEventQueue, ImeCompositionQueue, ImeCompositionRange, ImeEnableQueue, LoadingStateEvent,
+    LoadingStateQueue, MessageQueue, TitleChangeQueue, UrlChangeQueue,
 };
 use crate::utils::get_display_scale_factor;
 
 /// Bundles all the event queues used for browser-to-Godot communication.
 pub(crate) struct ClientQueues {
     pub message_queue: MessageQueue,
+    pub binary_message_queue: BinaryMessageQueue,
     pub url_change_queue: UrlChangeQueue,
     pub title_change_queue: TitleChangeQueue,
     pub loading_state_queue: LoadingStateQueue,
@@ -38,6 +39,7 @@ impl ClientQueues {
         use std::sync::atomic::AtomicBool;
         Self {
             message_queue: Arc::new(Mutex::new(VecDeque::new())),
+            binary_message_queue: Arc::new(Mutex::new(VecDeque::new())),
             url_change_queue: Arc::new(Mutex::new(VecDeque::new())),
             title_change_queue: Arc::new(Mutex::new(VecDeque::new())),
             loading_state_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -1058,15 +1060,7 @@ impl DownloadHandlerImpl {
     }
 }
 
-fn on_process_message_received(
-    _browser: Option<&mut cef::Browser>,
-    _frame: Option<&mut cef::Frame>,
-    _source_process: ProcessId,
-    message: Option<&mut ProcessMessage>,
-    message_queue: &MessageQueue,
-    ime_enable_queue: &ImeEnableQueue,
-    ime_composition_queue: &ImeCompositionQueue,
-) -> i32 {
+fn on_process_message_received(message: Option<&mut ProcessMessage>, ipc: &ClientIpcQueues) -> i32 {
     let Some(message) = message else { return 0 };
     let route = CefStringUtf16::from(&message.name()).to_string();
 
@@ -1075,8 +1069,25 @@ fn on_process_message_received(
             if let Some(args) = message.argument_list() {
                 let arg = args.string(0);
                 let msg_str = CefStringUtf16::from(&arg).to_string();
-                if let Ok(mut queue) = message_queue.lock() {
+                if let Ok(mut queue) = ipc.message_queue.lock() {
                     queue.push_back(msg_str);
+                }
+            }
+        }
+        "ipcBinaryRendererToGodot" => {
+            if let Some(args) = message.argument_list()
+                && let Some(binary_value) = args.binary(0)
+            {
+                let size = binary_value.size();
+                if size > 0 {
+                    let mut buffer = vec![0u8; size];
+                    let copied = binary_value.data(Some(&mut buffer), 0);
+                    if copied > 0 {
+                        buffer.truncate(copied);
+                        if let Ok(mut queue) = ipc.binary_message_queue.lock() {
+                            queue.push_back(buffer);
+                        }
+                    }
                 }
             }
         }
@@ -1084,7 +1095,7 @@ fn on_process_message_received(
             if let Some(args) = message.argument_list() {
                 let arg = args.bool(0);
                 let enabled = arg != 0;
-                if let Ok(mut queue) = ime_enable_queue.lock() {
+                if let Ok(mut queue) = ipc.ime_enable_queue.lock() {
                     queue.push_back(enabled);
                 }
             }
@@ -1094,7 +1105,7 @@ fn on_process_message_received(
                 let x = args.int(0);
                 let y = args.int(1);
                 let height = args.int(2);
-                if let Ok(mut queue) = ime_composition_queue.lock() {
+                if let Ok(mut queue) = ipc.ime_composition_queue.lock() {
                     *queue = Some(ImeCompositionRange {
                         caret_x: x,
                         caret_y: y,
@@ -1124,12 +1135,14 @@ pub(crate) struct ClientHandlers {
 #[derive(Clone)]
 pub(crate) struct ClientIpcQueues {
     pub message_queue: MessageQueue,
+    pub binary_message_queue: BinaryMessageQueue,
     pub ime_enable_queue: ImeEnableQueue,
     pub ime_composition_queue: ImeCompositionQueue,
 }
 
 fn build_ipc_queues(queues: &ClientQueues) -> ClientIpcQueues {
     ClientIpcQueues {
+        binary_message_queue: queues.binary_message_queue.clone(),
         message_queue: queues.message_queue.clone(),
         ime_enable_queue: queues.ime_enable_queue.clone(),
         ime_composition_queue: queues.ime_composition_queue.clone(),
@@ -1177,12 +1190,12 @@ wrap_client! {
 
         fn on_process_message_received(
             &self,
-            browser: Option<&mut cef::Browser>,
-            frame: Option<&mut cef::Frame>,
-            source_process: ProcessId,
+            _browser: Option<&mut cef::Browser>,
+            _frame: Option<&mut cef::Frame>,
+            _source_process: ProcessId,
             message: Option<&mut ProcessMessage>,
         ) -> i32 {
-            on_process_message_received(browser, frame, source_process, message, &self.ipc.message_queue, &self.ipc.ime_enable_queue, &self.ipc.ime_composition_queue)
+            on_process_message_received(message, &self.ipc)
         }
     }
 }
@@ -1284,12 +1297,12 @@ wrap_client! {
 
         fn on_process_message_received(
             &self,
-            browser: Option<&mut cef::Browser>,
-            frame: Option<&mut cef::Frame>,
-            source_process: ProcessId,
+            _browser: Option<&mut cef::Browser>,
+            _frame: Option<&mut cef::Frame>,
+            _source_process: ProcessId,
             message: Option<&mut ProcessMessage>,
         ) -> i32 {
-            on_process_message_received(browser, frame, source_process, message, &self.ipc.message_queue, &self.ipc.ime_enable_queue, &self.ipc.ime_composition_queue)
+            on_process_message_received(message, &self.ipc)
         }
     }
 }
